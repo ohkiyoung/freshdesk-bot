@@ -509,3 +509,20 @@ def freshdesk_create_webhook():
         except Exception:
             pass
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# 서버 자체 핑 - Render 무료 플랜 잠들기 방지
+import threading
+import time as time_module
+
+def self_ping():
+    time_module.sleep(60)  # 시작 후 1분 대기
+    while True:
+        try:
+            requests.get("https://freshdesk-bot-s1fa.onrender.com/health", timeout=10)
+            log("[핑] 서버 유지 성공")
+        except Exception as e:
+            log(f"[핑] 실패: {e}")
+        time_module.sleep(840)  # 14분마다
+
+threading.Thread(target=self_ping, daemon=True).start()
