@@ -3,6 +3,8 @@ import re
 import json
 import base64
 import requests
+import threading
+import time as time_module
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -94,9 +96,7 @@ def get_latest_comment(ticket_id):
 
 
 def search_freshdesk(query):
-    """최근 티켓에서 키워드로 필터링"""
     try:
-        # 최근 티켓 100건 가져오기
         res = requests.get(
             f"https://{FRESHDESK_DOMAIN}.freshdesk.com/api/v2/tickets?per_page=100&order_by=created_at&order_type=desc",
             headers=freshdesk_headers(),
@@ -109,7 +109,6 @@ def search_freshdesk(query):
         all_tickets = res.json()
         keywords = [w.lower() for w in query.strip().split()]
 
-        # 제목 또는 설명에 키워드 포함된 티켓 필터링
         matched = []
         for t in all_tickets:
             subject = (t.get("subject", "") or "").lower()
@@ -194,6 +193,10 @@ def answer_question(question, tickets):
 
 
 def summarize_ticket(subject, description, priority, status, latest_comment=""):
+    # 413 오류 방지 길이 제한
+    description = description[:2000] if description else ""
+    latest_comment = latest_comment[:1500] if latest_comment else ""
+
     prompt = (
         f"아래 Freshdesk 티켓을 분석해서 한국어로 요약하세요.\n\n"
         f"Subject: {subject}\n"
@@ -203,14 +206,20 @@ def summarize_ticket(subject, description, priority, status, latest_comment=""):
         f"Status: {STATUS_KO.get(str(status), status)}\n\n"
         "[문체 규칙]\n"
         "- 격식체 절대 사용 금지\n"
-        "- 뉴스 속보처럼 단문으로 끊어서 작성\n"
-        "- 중요한 세부 내용(수치, 날짜, 시스템명) 반드시 포함\n\n"
+        "- 모든 문장은 '~됨', '~임', '~함' 형태로 끝낼 것\n"
+        "- '~할 수 있어야 함', '~해 주세요', '~요청드립니다' 같은 요청형 표현 금지\n"
+        "- 상황을 객관적으로 서술하는 방식으로 작성\n"
+        "- 중요한 세부 내용(수치, 날짜, 시스템명, 서버명, DB정보, MRN 등) 반드시 포함\n\n"
         "[항목별 작성 기준]\n"
-        "- 핵심문의: Description 기반 문제 상황을 불렛(•)으로 3~5개\n"
-        "- 요청사항: Latest Comment 내용만 기반으로 작성. 없는 내용 절대 추가 금지. 1~3개\n\n"
-        "[불렛 예시]\n"
-        "• Jubail - Nephrology 코드 그룹 반영됨. 담당 의사 정상 표시됨.\n"
-        "• Yanbu - 동일 그룹 없어 대체 사용했으나 환자 목록 미반영됨.\n\n"
+        "- 핵심문의: Description 기반 문제 상황을 불렛(•)으로 3~5개. 발생한 상황과 영향을 객관적으로 서술.\n"
+        "- 요청사항: Latest Comment 내용을 빠짐없이 요약. 서버 목록, DB 접속 정보, 설정값 등 기술적 세부 내용은 반드시 포함. 없는 내용 추가 금지.\n\n"
+        "[핵심문의 예시]\n"
+        "좋은 예: • MRN 145197, 검체 번호 S-260002482 체크인 실수로 취소됨\n"
+        "        • 취소 후 주문 정보로 돌아가 재체크인 시도했으나 불가능한 상태\n"
+        "나쁜 예: • 취소 상태를 해제하거나 재체크인 가능하도록 해 주세요\n\n"
+        "[요청사항 예시]\n"
+        "좋은 예: • Staging/Clone 서버 목록(Stage-DB, HL7, WAS 등)과 DB 접속 정보(EXASTG) 상세히 전달하며 지원 요청함.\n"
+        "나쁜 예: • 지원 요청\n\n"
         "JSON 형식으로만 응답. 코드블록 없이:\n"
         '{"제목": "한국어로 간결하게", "핵심문의": "• 항목1\\n• 항목2\\n• 항목3", '
         '"요청사항": "• 항목1\\n• 항목2", "긴급도": "높음 또는 중간 또는 낮음", '
@@ -274,6 +283,61 @@ def build_message_without_summary(subject, description, ticket_id, ticket_url, p
     return "\n".join(lines)
 
 
+def build_create_message(summary, ticket_id, ticket_url, subject="", company=""):
+    urgency_emoji = {"높음": "🔴", "중간": "🟡", "낮음": "🟢"}.get(summary.get("긴급도", ""), "⚪")
+    dept_emoji    = {"개발팀": "💻", "운영팀": "🔧", "기획팀": "📋"}.get(summary.get("담당부서", ""), "📌")
+    lines = [
+        f"🆕 신규 티켓",
+        f"[{company}] 🐶" if company else "🐶",
+        f"Ticket No : #{ticket_id}",
+        f"Title : {subject}" if subject else None,
+        f"({summary.get('제목', '-')})",
+        "",
+        "💬 문의 내용",
+        summary.get("핵심문의", "-"),
+        "",
+        f"{urgency_emoji} 긴급도: {summary.get('긴급도', '-')}",
+        f"{dept_emoji} 담당: {summary.get('담당부서', '-')}",
+    ]
+    lines = [l for l in lines if l is not None]
+    if ticket_url:
+        lines += ["", f"🔗 {ticket_url}"]
+    return "\n".join(lines)
+
+
+def summarize_new_ticket(subject, description, priority, status):
+    description = description[:2000] if description else ""
+    prompt = (
+        f"아래 신규 Freshdesk 티켓을 분석해서 한국어로 요약하세요.\n\n"
+        f"Subject: {subject}\n"
+        f"Description: {description}\n"
+        f"Priority: {PRIORITY_KO.get(str(priority), priority)}\n"
+        f"Status: {STATUS_KO.get(str(status), status)}\n\n"
+        "[문체 규칙]\n"
+        "- 격식체 절대 사용 금지\n"
+        "- 단문으로 끊어서 작성\n"
+        "- 중요한 세부 내용(수치, 날짜, 시스템명) 반드시 포함\n\n"
+        "[작성 기준]\n"
+        "- 핵심문의: Description 기반 문제 상황을 불렛(•)으로 3~5개. 없는 내용 추가 금지.\n\n"
+        "[불렛 예시]\n"
+        "• Jubail - Nephrology 코드 그룹 반영됨. 담당 의사 정상 표시됨.\n"
+        "• Yanbu - 동일 그룹 없어 대체 사용했으나 환자 목록 미반영됨.\n\n"
+        "JSON 형식으로만 응답. 코드블록 없이:\n"
+        '{"제목": "한국어로 간결하게", "핵심문의": "• 항목1\\n• 항목2\\n• 항목3", '
+        '"긴급도": "높음 또는 중간 또는 낮음", "담당부서": "개발팀 또는 운영팀 또는 기획팀"}'
+    )
+    log("[Groq] 신규 티켓 요약 중...")
+    text = call_groq(prompt)
+    if not text:
+        return None
+    try:
+        text = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+    except Exception as e:
+        log(f"[Groq] JSON 파싱 오류: {e}")
+        return None
+
+
 def send_telegram(message):
     res = requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -304,9 +368,8 @@ def telegram_webhook():
             return jsonify({"status": "skip"}), 200
 
         log(f"[텔레그램] 메시지 수신: {text[:50]}")
-
         log(f"[텔레그램] 원문: {text}")
-        # 그룹에서 /search@botname 형식 처리
+
         if text.lower().startswith("/search"):
             query = re.sub(r'^/search(@\w+)?\s*', '', text, flags=re.IGNORECASE).strip()
         elif text.startswith("?"):
@@ -355,13 +418,13 @@ def freshdesk_webhook():
         data = request.json or {}
         fw = data.get("freshdesk_webhook", data)
 
-        ticket_id      = str(fw.get("ticket_id", ""))
-        subject        = fw.get("ticket_subject", fw.get("subject", ""))
-        description    = fw.get("ticket_description", fw.get("description_text", ""))
-        priority       = str(fw.get("ticket_priority", fw.get("priority", "2")))
-        status         = str(fw.get("ticket_status", fw.get("status", "2")))
-        ticket_url     = fw.get("ticket_url", "")
-        company        = fw.get("ticket_company", "")
+        ticket_id   = str(fw.get("ticket_id", ""))
+        subject     = fw.get("ticket_subject", fw.get("subject", ""))
+        description = fw.get("ticket_description", fw.get("description_text", ""))
+        priority    = str(fw.get("ticket_priority", fw.get("priority", "2")))
+        status      = str(fw.get("ticket_status", fw.get("status", "2")))
+        ticket_url  = fw.get("ticket_url", "")
+        company     = fw.get("ticket_company", "")
 
         description = strip_html(description)
 
@@ -399,87 +462,20 @@ def freshdesk_webhook():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "service": "freshdesk-telegram-bot"}), 200
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
-
-
-def build_create_message(summary, ticket_id, ticket_url, subject="", company=""):
-    """신규 티켓 생성 알림 메시지"""
-    urgency_emoji = {"높음": "🔴", "중간": "🟡", "낮음": "🟢"}.get(summary.get("긴급도", ""), "⚪")
-    dept_emoji    = {"개발팀": "💻", "운영팀": "🔧", "기획팀": "📋"}.get(summary.get("담당부서", ""), "📌")
-    lines = [
-        f"🆕 신규 티켓",
-        f"[{company}] 🐶" if company else "🐶",
-        f"Ticket No : #{ticket_id}",
-        f"Title : {subject}" if subject else None,
-        f"({summary.get('제목', '-')})",
-        "",
-        "💬 문의 내용",
-        summary.get("핵심문의", "-"),
-        "",
-        f"{urgency_emoji} 긴급도: {summary.get('긴급도', '-')}",
-        f"{dept_emoji} 담당: {summary.get('담당부서', '-')}",
-    ]
-    lines = [l for l in lines if l is not None]
-    if ticket_url:
-        lines += ["", f"🔗 {ticket_url}"]
-    return "\n".join(lines)
-
-
-def summarize_new_ticket(subject, description, priority, status):
-    """신규 티켓 요약 - 문의 내용 위주"""
-    prompt = (
-        f"아래 신규 Freshdesk 티켓을 분석해서 한국어로 요약하세요.\n\n"
-        f"Subject: {subject}\n"
-        f"Description: {description}\n"
-        f"Priority: {PRIORITY_KO.get(str(priority), priority)}\n"
-        f"Status: {STATUS_KO.get(str(status), status)}\n\n"
-        "[문체 규칙]\n"
-        "- 격식체 절대 사용 금지\n"
-        "- 단문으로 끊어서 작성\n"
-        "- 중요한 세부 내용(수치, 날짜, 시스템명) 반드시 포함\n\n"
-        "[작성 기준]\n"
-        "- 핵심문의: Description 기반 문제 상황을 불렛(•)으로 3~5개. 없는 내용 추가 금지.\n\n"
-        "[불렛 예시]\n"
-        "• Jubail - Nephrology 코드 그룹 반영됨. 담당 의사 정상 표시됨.\n"
-        "• Yanbu - 동일 그룹 없어 대체 사용했으나 환자 목록 미반영됨.\n\n"
-        "JSON 형식으로만 응답. 코드블록 없이:\n"
-        '{"제목": "한국어로 간결하게", "핵심문의": "• 항목1\\n• 항목2\\n• 항목3", '
-        '"긴급도": "높음 또는 중간 또는 낮음", "담당부서": "개발팀 또는 운영팀 또는 기획팀"}'
-    )
-    log("[Groq] 신규 티켓 요약 중...")
-    text = call_groq(prompt)
-    if not text:
-        return None
-    try:
-        text = text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
-    except Exception as e:
-        log(f"[Groq] JSON 파싱 오류: {e}")
-        return None
-
-
 @app.route("/webhook/freshdesk/create", methods=["POST"])
 def freshdesk_create_webhook():
-    """신규 티켓 생성 알림"""
     log("=== 신규 티켓 생성 웹훅 수신 ===")
     try:
         data = request.json or {}
         fw = data.get("freshdesk_webhook", data)
 
-        ticket_id  = str(fw.get("ticket_id", ""))
-        subject    = fw.get("ticket_subject", fw.get("subject", ""))
+        ticket_id   = str(fw.get("ticket_id", ""))
+        subject     = fw.get("ticket_subject", fw.get("subject", ""))
         description = fw.get("ticket_description", fw.get("description_text", ""))
-        priority   = str(fw.get("ticket_priority", fw.get("priority", "2")))
-        status     = str(fw.get("ticket_status", fw.get("status", "2")))
-        ticket_url = fw.get("ticket_url", "")
-        company    = fw.get("ticket_company", "")
+        priority    = str(fw.get("ticket_priority", fw.get("priority", "2")))
+        status      = str(fw.get("ticket_status", fw.get("status", "2")))
+        ticket_url  = fw.get("ticket_url", "")
+        company     = fw.get("ticket_company", "")
 
         description = strip_html(description)
 
@@ -511,18 +507,25 @@ def freshdesk_create_webhook():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# 서버 자체 핑 - Render 무료 플랜 잠들기 방지
-import threading
-import time as time_module
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "service": "freshdesk-telegram-bot"}), 200
 
+
+# 서버 자체 핑 - Render 무료 플랜 잠들기 방지
 def self_ping():
-    time_module.sleep(60)  # 시작 후 1분 대기
+    time_module.sleep(60)
     while True:
         try:
             requests.get("https://freshdesk-bot-s1fa.onrender.com/health", timeout=10)
             log("[핑] 서버 유지 성공")
         except Exception as e:
             log(f"[핑] 실패: {e}")
-        time_module.sleep(840)  # 14분마다
+        time_module.sleep(840)
 
 threading.Thread(target=self_ping, daemon=True).start()
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
