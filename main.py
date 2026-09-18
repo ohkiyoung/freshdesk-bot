@@ -227,7 +227,7 @@ def summarize_ticket(subject, description, priority, status, latest_comment=""):
         "JSON 형식으로만 응답. 코드블록 없이:\n"
         '{"제목": "한국어로 간결하게", "핵심문의": "• 항목1\\n• 항목2\\n• 항목3", '
         '"요청사항": "• 항목1\\n• 항목2", "긴급도": "높음 또는 중간 또는 낮음", '
-        '"담당부서": "개발팀 또는 운영팀 또는 기획팀"}'
+        '"담당부서": "개발팀 또는 운영팀 또는 기획팀", "담당파트": "진료/간호 또는 원무/보험 또는 진료지원"}'
     )
 
     log("[Groq] 요약 시도 중...")
@@ -248,6 +248,7 @@ def summarize_ticket(subject, description, priority, status, latest_comment=""):
 def build_message_with_summary(summary, ticket_id, ticket_url, subject="", company=""):
     urgency_emoji = {"높음": "🔴", "중간": "🟡", "낮음": "🟢"}.get(summary.get("긴급도", ""), "⚪")
     dept_emoji    = {"개발팀": "💻", "운영팀": "🔧", "기획팀": "📋"}.get(summary.get("담당부서", ""), "📌")
+    part_emoji    = {"진료/간호": "🩺", "원무/보험": "💳", "진료지원": "🔬"}.get(summary.get("담당파트", ""), "📂")
     lines = [
         f"[{company}] 🐶" if company else "🐶",
         f"Ticket No : #{ticket_id}",
@@ -262,6 +263,7 @@ def build_message_with_summary(summary, ticket_id, ticket_url, subject="", compa
         "",
         f"{urgency_emoji} 긴급도: {summary.get('긴급도', '-')}",
         f"{dept_emoji} 담당: {summary.get('담당부서', '-')}",
+        f"{part_emoji} 파트: {summary.get('담당파트', '-')}",
     ]
     lines = [l for l in lines if l is not None]
     if ticket_url:
@@ -329,7 +331,7 @@ def summarize_new_ticket(subject, description, priority, status):
         "• Yanbu - 동일 그룹 없어 대체 사용했으나 환자 목록 미반영됨.\n\n"
         "JSON 형식으로만 응답. 코드블록 없이:\n"
         '{"제목": "한국어로 간결하게", "핵심문의": "• 항목1\\n• 항목2\\n• 항목3", '
-        '"긴급도": "높음 또는 중간 또는 낮음", "담당부서": "개발팀 또는 운영팀 또는 기획팀"}'
+        '"긴급도": "높음 또는 중간 또는 낮음", "담당부서": "개발팀 또는 운영팀 또는 기획팀", "담당파트": "진료/간호 또는 원무/보험 또는 진료지원"}'
     )
     log("[Groq] 신규 티켓 요약 중...")
     text = call_groq(prompt)
