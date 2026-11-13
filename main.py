@@ -5,6 +5,7 @@ import base64
 import requests
 import threading
 import time as time_module
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -36,23 +37,43 @@ def strip_html(text):
     return text
 
 
+QUOTE_MARKERS = [
+    r'\bFrom:\s.{1,150}?\bSent:',          # Outlook 스타일 헤더
+    r'\bOn\s.{5,120}?\bwrote:',            # Gmail 스타일 헤더
+    r'-{3,}\s*Original Message\s*-{3,}',
+    r'보내는\s?사람\s*:',                    # 한국어 메일 헤더
+]
+
+
 def strip_email_quotes(text):
+    """이메일 인용(이전 대화)을 잘라내고 최신 본문만 남김. 공백으로 합쳐진 텍스트도 처리."""
     if not text:
         return ""
-    patterns = [r'On .+wrote:', r'From:.+Sent:', r'-----Original Message-----']
-    lines = text.split('\n')
-    clean_lines = []
-    for line in lines:
-        is_quote = False
-        for pattern in patterns:
-            if re.search(pattern, line, re.IGNORECASE):
-                is_quote = True
-                break
-        if is_quote:
-            break
-        clean_lines.append(line)
-    result = '\n'.join(clean_lines).strip()
+    cut = len(text)
+    for pattern in QUOTE_MARKERS:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m and m.start() > 0:
+            cut = min(cut, m.start())
+    result = text[:cut].strip()
     return result if result else text
+
+
+def clean_body(html, limit=None):
+    """Freshdesk HTML 본문 -> 인용 제거된 순수 텍스트"""
+    if not html:
+        return ""
+    head = re.split(r'<div[^>]*freshdesk_quote|<blockquote', html, maxsplit=1, flags=re.IGNORECASE)[0]
+    text = strip_email_quotes(strip_html(head))
+    if not text.strip():
+        text = strip_email_quotes(strip_html(html))
+    return text[:limit] if limit else text
+
+
+def make_ticket_url(ticket_id, fallback=""):
+    """에이전트 화면 직행 링크 (이미 로그인된 브라우저면 바로 열림)"""
+    if ticket_id:
+        return f"https://{FRESHDESK_DOMAIN}.freshdesk.com/a/tickets/{ticket_id}"
+    return fallback
 
 
 def freshdesk_headers():
@@ -87,7 +108,7 @@ def get_latest_comment(ticket_id):
             return ""
 
         latest = sorted(public, key=lambda x: x.get("created_at", ""), reverse=True)[0]
-        body = strip_email_quotes(strip_html(latest.get("body", "")))
+        body = clean_body(latest.get("body", ""))
         log(f"[Freshdesk API] 최신 댓글: {body[:100]}")
         return body
     except Exception as e:
@@ -266,8 +287,6 @@ def build_message_with_summary(summary, ticket_id, ticket_url, subject="", compa
         f"{part_emoji} 파트: {summary.get('담당파트', '-')}",
     ]
     lines = [l for l in lines if l is not None]
-    if ticket_url:
-        lines += ["", f"🔗 {ticket_url}"]
     return "\n".join(lines)
 
 
@@ -284,8 +303,6 @@ def build_message_without_summary(subject, description, ticket_id, ticket_url, p
         f"📊 상태: {STATUS_KO.get(str(status), status)}",
     ]
     lines = [l for l in lines if l is not None]
-    if ticket_url:
-        lines += ["", f"🔗 {ticket_url}"]
     return "\n".join(lines)
 
 
@@ -306,8 +323,6 @@ def build_create_message(summary, ticket_id, ticket_url, subject="", company="")
         f"{dept_emoji} 담당: {summary.get('담당부서', '-')}",
     ]
     lines = [l for l in lines if l is not None]
-    if ticket_url:
-        lines += ["", f"🔗 {ticket_url}"]
     return "\n".join(lines)
 
 
@@ -345,13 +360,28 @@ def summarize_new_ticket(subject, description, priority, status):
         return None
 
 
-def send_telegram(message):
+def send_telegram(message, button_url=None):
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    if button_url:
+        payload["reply_markup"] = {
+            "inline_keyboard": [[{"text": "🔗 티켓 열기", "url": button_url}]]
+        }
     res = requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+        json=payload,
         timeout=10,
     )
-    return res.json().get("ok", False)
+    ok = res.json().get("ok", False)
+    if not ok and button_url:
+        # 버튼 전송 실패 시 링크를 본문에 넣어 재시도 (알림 누락 방지)
+        log(f"[텔레그램] 버튼 전송 실패, 텍스트 링크로 재시도: {res.text[:150]}")
+        res = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": f"{message}\n\n🔗 {button_url}"},
+            timeout=10,
+        )
+        ok = res.json().get("ok", False)
+    return ok
 
 
 def send_telegram_to(chat_id, message):
@@ -363,11 +393,250 @@ def send_telegram_to(chat_id, message):
     return res.json().get("ok", False)
 
 
+
+# ───────────── /timeline : 티켓 흐름 한눈에 보기 ─────────────
+KST = timezone(timedelta(hours=9))
+TIMELINE_STATUS = {2: "접수", 3: "대기중", 4: "해결됨", 5: "종료", 6: "고객 답변 대기", 7: "제3자 대기"}
+MAX_TIMELINE_ENTRIES = 40
+
+
+def is_allowed_chat(chat_id):
+    """/timeline은 내부메모를 포함하므로 허용된 채팅에서만 동작"""
+    allowed = {TELEGRAM_CHAT_ID.strip()} if TELEGRAM_CHAT_ID else set()
+    extra = os.environ.get("ALLOWED_CHAT_IDS", "")
+    allowed |= {x.strip() for x in extra.split(",") if x.strip()}
+    return str(chat_id) in allowed
+
+
+def parse_fd_time(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(KST)
+    except Exception:
+        return None
+
+
+def fd_get(path, timeout=15):
+    return requests.get(
+        f"https://{FRESHDESK_DOMAIN}.freshdesk.com/api/v2/{path}",
+        headers=freshdesk_headers(),
+        timeout=timeout,
+    )
+
+
+def resolve_user_name(uid, agent_first, cache, budget):
+    """user_id -> 이름. 실패하면 None (조회 횟수 제한)"""
+    if not uid:
+        return None
+    if uid in cache:
+        return cache[uid]
+    name = None
+    for kind in (["agents", "contacts"] if agent_first else ["contacts", "agents"]):
+        if budget[0] <= 0:
+            break
+        budget[0] -= 1
+        try:
+            r = fd_get(f"{kind}/{uid}", timeout=5)
+            if r.status_code == 200:
+                j = r.json()
+                name = (j.get("contact") or {}).get("name") or j.get("name")
+                if name:
+                    break
+        except Exception:
+            pass
+    cache[uid] = name
+    return name
+
+
+def fetch_conversations(ticket_id):
+    items, page = [], 1
+    while page <= 10:
+        r = fd_get(f"tickets/{ticket_id}/conversations?page={page}&per_page=100")
+        if r.status_code != 200:
+            return None, r.status_code
+        data = r.json()
+        items.extend(data)
+        if len(data) < 100:
+            break
+        page += 1
+    return items, None
+
+
+def build_timeline_entries(ticket, convs, cache, budget):
+    entries = [{
+        "time": parse_fd_time(ticket.get("created_at", "")),
+        "side": "customer",
+        "kind": "접수",
+        "who": resolve_user_name(ticket.get("requester_id"), False, cache, budget) or "고객",
+        "text": clean_body(ticket.get("description") or ticket.get("description_text", "")),
+    }]
+    for cv in sorted(convs, key=lambda x: x.get("created_at", "")):
+        private = bool(cv.get("private"))
+        incoming = bool(cv.get("incoming"))
+        if private:
+            side, kind, default_who = "note", "내부메모", "에이전트"
+        elif incoming:
+            side, kind, default_who = "customer", "고객 회신", "고객"
+        else:
+            side, kind, default_who = "agent", "에이전트 회신", "에이전트"
+        who = resolve_user_name(cv.get("user_id"), side != "customer", cache, budget) or default_who
+        entries.append({
+            "time": parse_fd_time(cv.get("created_at", "")),
+            "side": side, "kind": kind, "who": who,
+            "text": clean_body(cv.get("body") or cv.get("body_text", "")),
+        })
+    return entries
+
+
+def summarize_timeline(entries):
+    """항목별 한 줄 요약 + 현재 상황. 실패하면 (None, None)"""
+    n = len(entries)
+    per = max(120, min(400, 6000 // n))  # 413 방지: 전체 입력 길이 제한
+    convo = "\n".join(
+        f"{i}. [{e['kind']}/{e['who']}] {e['text'][:per] or '(내용 없음)'}"
+        for i, e in enumerate(entries, 1)
+    )
+    prompt = (
+        f"아래는 Freshdesk 티켓의 시간순 대화 {n}건이야. 각 항목을 한국어 한 줄로 요약하고, 마지막에 현재 상황을 정리해.\n\n"
+        "[규칙]\n"
+        "- 항목당 한 줄, 70자 이내, '~함/~됨/~요청함/~제공함' 형태의 단문 (격식체 금지)\n"
+        "- MRN, 환자번호, 서버명, 날짜, 수치 같은 핵심 정보는 유지\n"
+        "- 인사말, 서명, 면책 문구는 무시\n"
+        "- 'reminder', 'any update' 같은 단순 재촉은 '단순 리마인더(추가 정보 없음)'로 요약\n"
+        "- 원문에 없는 내용 추가 금지\n"
+        f"- lines 배열은 입력 순서 그대로 정확히 {n}개\n"
+        "- current: 지금까지의 흐름과 현재 상황을 2문장 이내로\n\n"
+        f"[대화]\n{convo}\n\n"
+        'JSON으로만 응답 (코드블록 금지): {"lines": ["...", "..."], "current": "..."}'
+    )
+    text = call_groq(prompt)
+    if not text:
+        return None, None
+    try:
+        data = json.loads(text.replace("```json", "").replace("```", "").strip())
+        lines = data.get("lines")
+        if isinstance(lines, list) and len(lines) == n:
+            return [str(x).strip() for x in lines], str(data.get("current", "")).strip()
+        log(f"[타임라인] 요약 줄 수 불일치: {len(lines) if isinstance(lines, list) else 'N/A'} != {n}")
+    except Exception as e:
+        log(f"[타임라인] JSON 파싱 오류: {e}")
+    return None, None
+
+
+def ball_in_court(entries, status):
+    public = [e for e in entries if e["side"] != "note"]
+    if status in (4, 5):
+        return "✅ 처리 완료 상태"
+    last = public[-1]
+    if last["side"] == "customer":
+        msg = "🔔 우리 쪽 답변 필요 (고객이 마지막으로 회신)" if len(public) > 1 \
+            else "🔔 우리 쪽 첫 답변 필요 (접수 후 회신 없음)"
+    else:
+        msg = "⏳ 고객 회신 대기 (우리가 마지막으로 회신)"
+    t_last, t_pub = entries[-1]["time"], last["time"]
+    if entries[-1]["side"] == "note" and t_last and t_pub and t_last > t_pub:
+        msg += " · 이후 내부 논의 진행 중"
+    return msg
+
+
+def ago_text(t):
+    if not t:
+        return "알 수 없음"
+    delta = datetime.now(KST) - t
+    if delta.days >= 1:
+        return f"{delta.days}일 전"
+    hours = delta.seconds // 3600
+    return f"{hours}시간 전" if hours >= 1 else "방금 전"
+
+
+def send_long(chat_id, text, limit=3800):
+    chunk = ""
+    for line in text.split("\n"):
+        if chunk and len(chunk) + len(line) + 1 > limit:
+            send_telegram_to(chat_id, chunk.rstrip())
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        send_telegram_to(chat_id, chunk.rstrip())
+
+
+def run_timeline(chat_id, ticket_id):
+    try:
+        r = fd_get(f"tickets/{ticket_id}")
+        if r.status_code == 404:
+            send_telegram_to(chat_id, f"티켓 #{ticket_id}을(를) 찾을 수 없어요. 번호를 확인해 주세요.")
+            return
+        if r.status_code != 200:
+            send_telegram_to(chat_id, f"Freshdesk 조회에 실패했어요. (코드 {r.status_code})")
+            return
+        ticket = r.json()
+        convs, err = fetch_conversations(ticket_id)
+        if err:
+            send_telegram_to(chat_id, f"대화 내역 조회에 실패했어요. (코드 {err})")
+            return
+
+        entries = build_timeline_entries(ticket, convs, {}, [10])
+        total, omitted = len(entries), 0
+        if total > MAX_TIMELINE_ENTRIES:
+            omitted = total - MAX_TIMELINE_ENTRIES
+            entries = entries[:1] + entries[-(MAX_TIMELINE_ENTRIES - 1):]
+
+        summaries, current = summarize_timeline(entries)
+        ai_ok = summaries is not None
+        if not ai_ok:
+            summaries = [(e["text"][:70] + ("…" if len(e["text"]) > 70 else "")) or "(내용 없음)" for e in entries]
+            current = "AI 요약에 실패해 원문 일부를 표시했어요."
+
+        icons = {"customer": "👤", "agent": "🛠", "note": "📝"}
+        status = ticket.get("status")
+        created = parse_fd_time(ticket.get("created_at", ""))
+        head = [
+            f"🕘 #{ticket_id} 타임라인",
+            (ticket.get("subject") or "")[:150],
+            f"상태: {TIMELINE_STATUS.get(status, f'상태코드 {status}')} · "
+            f"접수 {created.strftime('%m/%d') if created else '-'} · 대화 {total}건",
+            f"마지막 활동: {ago_text(entries[-1]['time'])}",
+            ball_in_court(entries, status),
+            "",
+        ]
+        body = []
+        for i, (e, s) in enumerate(zip(entries, summaries)):
+            t = e["time"].strftime("%m/%d %H:%M") if e["time"] else "--/-- --:--"
+            body.append(f"{t} {icons[e['side']]} {e['who'][:16]} · {s}")
+            if i == 0 and omitted:
+                body.append(f"   … 중간 {omitted}건 생략 …")
+        tail = ["", "📌 현재 상황", current or "-"]
+        send_long(chat_id, "\n".join(head + body + tail))
+    except Exception as ex:
+        log(f"[타임라인] 오류: {ex}")
+        try:
+            send_telegram_to(chat_id, "타임라인 생성 중 오류가 발생했어요. 잠시 후 다시 시도해 주세요.")
+        except Exception:
+            pass
+
+
+def handle_timeline_command(chat_id, text):
+    if not is_allowed_chat(chat_id):
+        send_telegram_to(
+            chat_id,
+            "이 채팅에서는 /timeline을 사용할 수 없어요.\n"
+            f"(chat id: {chat_id})\n관리자가 Render 환경변수 ALLOWED_CHAT_IDS에 이 값을 추가하면 사용할 수 있어요.",
+        )
+        return
+    m = re.search(r'(\d{3,})', text)
+    if not m:
+        send_telegram_to(chat_id, "티켓 번호를 입력해 주세요. 예: /timeline 14564")
+        return
+    ticket_id = m.group(1)
+    send_telegram_to(chat_id, f"⏳ #{ticket_id} 타임라인 정리 중...")
+    threading.Thread(target=run_timeline, args=(chat_id, ticket_id), daemon=True).start()
+
+
 @app.route("/webhook/telegram", methods=["POST"])
 def telegram_webhook():
     try:
         data = request.json or {}
-        message = data.get("message", {})
+        # 그룹/1:1은 "message", 채널은 "channel_post"로 들어옴
+        message = data.get("message") or data.get("channel_post") or {}
         chat_id = str(message.get("chat", {}).get("id", ""))
         text = message.get("text", "").strip()
 
@@ -376,6 +645,10 @@ def telegram_webhook():
 
         log(f"[텔레그램] 메시지 수신: {text[:50]}")
         log(f"[텔레그램] 원문: {text}")
+
+        if re.match(r'^/timeline(@\w+)?(\s|$)', text, re.IGNORECASE):
+            handle_timeline_command(chat_id, text)
+            return jsonify({"status": "ok"}), 200
 
         if text.lower().startswith("/search"):
             query = re.sub(r'^/search(@\w+)?\s*', '', text, flags=re.IGNORECASE).strip()
@@ -430,7 +703,7 @@ def freshdesk_webhook():
         description = fw.get("ticket_description", fw.get("description_text", ""))
         priority    = str(fw.get("ticket_priority", fw.get("priority", "2")))
         status      = str(fw.get("ticket_status", fw.get("status", "2")))
-        ticket_url  = fw.get("ticket_url", "")
+        ticket_url  = make_ticket_url(str(fw.get("ticket_id", "")), fw.get("ticket_url", ""))
         company     = fw.get("ticket_company", "")
 
         description = strip_html(description)
@@ -456,7 +729,7 @@ def freshdesk_webhook():
             mode = "raw"
 
         log(f"텔레그램 발송 모드: {mode}")
-        ok = send_telegram(message)
+        ok = send_telegram(message, ticket_url)
         log(f"텔레그램 발송 결과: {'성공' if ok else '실패'}")
         return jsonify({"status": "ok" if ok else "telegram_failed", "mode": mode}), 200
 
@@ -481,7 +754,7 @@ def freshdesk_create_webhook():
         description = fw.get("ticket_description", fw.get("description_text", ""))
         priority    = str(fw.get("ticket_priority", fw.get("priority", "2")))
         status      = str(fw.get("ticket_status", fw.get("status", "2")))
-        ticket_url  = fw.get("ticket_url", "")
+        ticket_url  = make_ticket_url(str(fw.get("ticket_id", "")), fw.get("ticket_url", ""))
         company     = fw.get("ticket_company", "")
 
         description = strip_html(description)
@@ -501,7 +774,7 @@ def freshdesk_create_webhook():
             mode = "raw"
 
         log(f"신규 티켓 발송 모드: {mode}")
-        ok = send_telegram(message)
+        ok = send_telegram(message, ticket_url)
         log(f"텔레그램 발송 결과: {'성공' if ok else '실패'}")
         return jsonify({"status": "ok" if ok else "telegram_failed", "mode": mode}), 200
 
@@ -519,18 +792,59 @@ def health():
     return jsonify({"status": "ok", "service": "freshdesk-telegram-bot"}), 200
 
 
+def ping_url():
+    """자기 자신의 /health 주소: SELF_URL > Render 자동 환경변수 > 기존 주소 순"""
+    base = os.environ.get("SELF_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://freshdesk-bot-s1fa.onrender.com"
+    return base.rstrip("/") + "/health"
+
+
 # 서버 자체 핑 - Render 무료 플랜 잠들기 방지
 def self_ping():
     time_module.sleep(60)
     while True:
         try:
-            requests.get("https://freshdesk-bot-s1fa.onrender.com/health", timeout=10)
+            requests.get(ping_url(), timeout=10)
             log("[핑] 서버 유지 성공")
         except Exception as e:
             log(f"[핑] 실패: {e}")
         time_module.sleep(840)
 
 threading.Thread(target=self_ping, daemon=True).start()
+
+
+# 서버 시작(배포 완료) 알림
+STARTUP_LOCK = "/tmp/.freshdesk_bot_started"
+REQUIRED_ENV = ["GROQ_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "FRESHDESK_API_KEY", "FRESHDESK_DOMAIN"]
+
+
+def notify_startup(delay=5):
+    """컨테이너가 시작될 때 한 번만 텔레그램으로 알림 (워커만 재시작되면 건너뜀)"""
+    try:
+        time_module.sleep(delay)
+        try:
+            fd = os.open(STARTUP_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+        except FileExistsError:
+            return
+        except OSError:
+            pass  # 잠금 파일을 못 만들어도 알림은 보냄
+
+        commit = (os.environ.get("RENDER_GIT_COMMIT") or "")[:7]
+        lines = [
+            "🚀 봇 서버가 시작됐어요",
+            f"버전: {commit}" if commit else None,
+            f"시각: {datetime.now(KST).strftime('%m/%d %H:%M')} (KST)",
+        ]
+        missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
+        if missing:
+            lines += ["", "⚠️ 설정되지 않은 환경변수: " + ", ".join(missing)]
+        send_telegram("\n".join(l for l in lines if l is not None))
+        log("[시작알림] 전송 완료")
+    except Exception as e:
+        log(f"[시작알림] 실패: {e}")
+
+
+threading.Thread(target=notify_startup, daemon=True).start()
 
 
 if __name__ == "__main__":
