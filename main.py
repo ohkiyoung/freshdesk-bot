@@ -147,22 +147,31 @@ def search_freshdesk(query):
         return []
 
 
-def call_groq(prompt, temperature=0.3):
+def call_groq(prompt, temperature=0.3, effort=None):
+    """Groq 호출. effort("low" 등)는 gpt-oss 모델에서만 사용하고, 거부되면 effort 없이 재시도."""
     models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "groq/compound-mini"]
     for model in models:
-        try:
-            res = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_API_KEY}"},
-                json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": temperature},
-                timeout=20,
-            )
-            if res.status_code == 200:
-                return res.json()["choices"][0]["message"]["content"].strip()
-            else:
-                log(f"[Groq] {model} 실패: {res.status_code}")
-        except Exception as e:
-            log(f"[Groq] {model} 오류: {e}")
+        use_effort = bool(effort) and model.startswith("openai/gpt-oss")
+        for attempt in range(2 if use_effort else 1):
+            payload = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": temperature}
+            if use_effort and attempt == 0:
+                payload["reasoning_effort"] = effort
+            try:
+                res = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_API_KEY}"},
+                    json=payload,
+                    timeout=20,
+                )
+                if res.status_code == 200:
+                    return res.json()["choices"][0]["message"]["content"].strip()
+                log(f"[Groq] {model} 실패: {res.status_code} {res.text[:150]}")
+                if res.status_code == 400 and use_effort and attempt == 0:
+                    continue  # 파라미터 문제일 수 있어 effort 없이 한 번 더
+                break
+            except Exception as ex:
+                log(f"[Groq] {model} 오류: {ex}")
+                break
     return None
 
 
@@ -487,44 +496,128 @@ def build_timeline_entries(ticket, convs, cache, budget):
     return entries
 
 
-def summarize_timeline(entries):
-    """항목별 한 줄 요약 + 현재 상황. 실패하면 (None, None)"""
-    n = len(entries)
-    per = max(120, min(400, 6000 // n))  # 413 방지: 전체 입력 길이 제한
+def extract_json(text):
+    """응답에서 첫 { 부터 마지막 } 까지만 잘라 JSON 파싱 (앞뒤 군더더기 허용)"""
+    if not text:
+        return None
+    t = text.replace("```json", "").replace("```", "").strip()
+    a, b = t.find("{"), t.rfind("}")
+    if a == -1 or b <= a:
+        return None
+    try:
+        return json.loads(t[a:b + 1])
+    except Exception:
+        return None
+
+
+def raw_snippet(e):
+    txt = e["text"]
+    return (txt[:70] + ("…" if len(txt) > 70 else "")) or "(내용 없음)"
+
+
+TIMELINE_BATCH = 10
+
+
+def summarize_batch(batch, start_no):
+    """항목 번호 -> 한 줄 요약 dict. 일부만 성공해도 그만큼 반환"""
     convo = "\n".join(
-        f"{i}. [{e['kind']}/{e['who']}] {e['text'][:per] or '(내용 없음)'}"
-        for i, e in enumerate(entries, 1)
+        f"{start_no + i}. [{e['kind']}/{e['who']}] {e['text'][:220] or '(내용 없음)'}"
+        for i, e in enumerate(batch)
     )
     prompt = (
-        f"아래는 Freshdesk 티켓의 시간순 대화 {n}건이야. 각 항목을 한국어 한 줄로 요약하고, 마지막에 현재 상황을 정리해.\n\n"
+        "아래는 Freshdesk 티켓 대화의 일부야. 번호별로 한국어 한 줄로 요약해.\n\n"
         "[규칙]\n"
         "- 항목당 한 줄, 70자 이내, '~함/~됨/~요청함/~제공함' 형태의 단문 (격식체 금지)\n"
         "- MRN, 환자번호, 서버명, 날짜, 수치 같은 핵심 정보는 유지\n"
         "- 인사말, 서명, 면책 문구는 무시\n"
         "- 'reminder', 'any update' 같은 단순 재촉은 '단순 리마인더(추가 정보 없음)'로 요약\n"
-        "- 원문에 없는 내용 추가 금지\n"
-        f"- lines 배열은 입력 순서 그대로 정확히 {n}개\n"
-        "- current: 지금까지의 흐름과 현재 상황을 2문장 이내로\n\n"
+        "- 원문에 없는 내용 추가 금지\n\n"
         f"[대화]\n{convo}\n\n"
-        'JSON으로만 응답 (코드블록 금지): {"lines": ["...", "..."], "current": "..."}'
+        'JSON으로만 응답: {"번호": "요약", ...} 형태. 키는 위 번호와 똑같이 사용.'
     )
-    text = call_groq(prompt)
-    if not text:
-        return None, None
+    data = extract_json(call_groq(prompt, temperature=0.2, effort="low"))
+    out = {}
+    if isinstance(data, dict):
+        for k, v in data.items():
+            try:
+                out[int(str(k).strip().rstrip("."))] = str(v).strip()
+            except ValueError:
+                continue
+    return out
+
+
+def summarize_current(entries, lines):
+    """첫 문의 + 최근 진행 요약을 바탕으로 현재 상황 2문장"""
+    recent = list(zip(entries, lines))[-12:]
+    recent_txt = "\n".join(
+        f"{e['time'].strftime('%m/%d') if e['time'] else '--/--'} {e['kind']}/{e['who']}: {l}" for e, l in recent
+    )
+    prompt = (
+        "아래는 티켓의 첫 문의 요약과 최근 진행 내용이야. 지금까지의 흐름과 현재 상황을 2문장 이내로 정리해.\n"
+        "- '~함/~됨' 형태의 단문, 격식체 금지\n- 아래에 없는 내용 추가 금지\n- 문장만 출력 (JSON, 번호 금지)\n\n"
+        f"[첫 문의]\n{lines[0]}\n\n[최근 진행]\n{recent_txt}"
+    )
+    text = call_groq(prompt, temperature=0.2, effort="low")
+    return (text or "").strip()[:400]
+
+
+def summarize_timeline(entries):
+    """(줄 목록, 현재 상황, 실패한 항목 수). 전부 실패하면 (None, None, 0)"""
+    n = len(entries)
+    lines = [None] * n
+    for start in range(0, n, TIMELINE_BATCH):
+        batch = entries[start:start + TIMELINE_BATCH]
+        res = summarize_batch(batch, start + 1)
+        for i in range(len(batch)):
+            lines[start + i] = res.get(start + i + 1)
+        log(f"[타임라인] {start + 1}~{start + len(batch)}번 중 {sum(1 for i in range(len(batch)) if lines[start + i])}건 요약 성공")
+    ok = sum(1 for l in lines if l)
+    if ok == 0:
+        return None, None, 0
+    failed = n - ok
+    lines = [l or raw_snippet(entries[i]) for i, l in enumerate(lines)]
+    return lines, summarize_current(entries, lines), failed
+
+
+_status_cache = {"t": 0.0, "labels": {}}
+
+
+def get_status_labels():
+    """Freshdesk 상태 코드 -> 이름 (커스텀 상태 포함). 1시간 캐시, 실패하면 빈 dict"""
+    if _status_cache["labels"] and time_module.time() - _status_cache["t"] < 3600:
+        return _status_cache["labels"]
+    labels = {}
     try:
-        data = json.loads(text.replace("```json", "").replace("```", "").strip())
-        lines = data.get("lines")
-        if isinstance(lines, list) and len(lines) == n:
-            return [str(x).strip() for x in lines], str(data.get("current", "")).strip()
-        log(f"[타임라인] 요약 줄 수 불일치: {len(lines) if isinstance(lines, list) else 'N/A'} != {n}")
-    except Exception as e:
-        log(f"[타임라인] JSON 파싱 오류: {e}")
-    return None, None
+        r = fd_get("ticket_fields?type=default_status", timeout=8)
+        if r.status_code == 200:
+            for f in r.json():
+                ch = f.get("choices") or {}
+                if isinstance(ch, dict):
+                    for k, v in ch.items():
+                        labels[int(k)] = v[0] if isinstance(v, list) and v else str(v)
+                elif isinstance(ch, list):
+                    for item in ch:
+                        if isinstance(item, dict) and "id" in item:
+                            labels[int(item["id"])] = item.get("label") or item.get("value") or str(item["id"])
+        else:
+            log(f"[타임라인] 상태 목록 조회 실패: {r.status_code}")
+    except Exception as ex:
+        log(f"[타임라인] 상태 목록 예외: {ex}")
+    if labels:
+        _status_cache["labels"], _status_cache["t"] = labels, time_module.time()
+    return labels
 
 
-def ball_in_court(entries, status):
+DONE_PATTERN = re.compile(r"resolved|closed|완료|해결|종료", re.IGNORECASE)
+
+
+def status_text(code):
+    return get_status_labels().get(code) or TIMELINE_STATUS.get(code) or f"상태코드 {code}"
+
+
+def ball_in_court(entries, done):
     public = [e for e in entries if e["side"] != "note"]
-    if status in (4, 5):
+    if done:
         return "✅ 처리 완료 상태"
     last = public[-1]
     if last["side"] == "customer":
@@ -559,7 +652,104 @@ def send_long(chat_id, text, limit=3800):
         send_telegram_to(chat_id, chunk.rstrip())
 
 
-def run_timeline(chat_id, ticket_id):
+RECENT_COUNT = 10
+ICONS = {"customer": "👤", "agent": "🛠", "note": "📝"}
+
+
+def render_line(e, s):
+    t = e["time"].strftime("%m/%d %H:%M") if e["time"] else "--/-- --:--"
+    return f"{t} {ICONS[e['side']]} {e['who'][:22]} · {s}"
+
+
+def date_range(items):
+    a, b = items[0]["time"], items[-1]["time"]
+    fa = a.strftime("%m/%d") if a else "?"
+    fb = b.strftime("%m/%d") if b else "?"
+    return fa if fa == fb else f"{fa}~{fb}"
+
+
+def limit_entries(all_entries):
+    """/all 용: 너무 길면 접수 + 최근 (MAX-1)건만 남기고 중간 생략"""
+    total = len(all_entries)
+    if total <= MAX_TIMELINE_ENTRIES:
+        return all_entries, 0
+    return all_entries[:1] + all_entries[-(MAX_TIMELINE_ENTRIES - 1):], total - MAX_TIMELINE_ENTRIES
+
+
+def summarize_middle(middle):
+    """이전 대화 전체를 3~5줄로 요약. 실패하면 None"""
+    used, skipped = middle, 0
+    if len(middle) > 80:  # 요청이 너무 커지지 않게 제한
+        used = middle[:10] + middle[-70:]
+        skipped = len(middle) - 80
+    per = max(60, min(200, 5000 // len(used)))
+    convo = "\n".join(
+        f"{e['time'].strftime('%m/%d') if e['time'] else '--/--'} [{e['kind']}/{e['who']}] {e['text'][:per] or '(내용 없음)'}"
+        for e in used
+    )
+    prompt = (
+        f"아래는 Freshdesk 티켓의 이전 대화 {len(middle)}건이야. 흐름을 3~5줄로 요약해.\n\n"
+        "[규칙]\n"
+        "- 줄마다 '• '로 시작, 70자 이내, '~함/~됨/~요청함' 형태의 단문 (격식체 금지)\n"
+        "- 원인 분석, 합의된 해결 방향, 일정, 미해결 사항은 날짜와 함께 반드시 포함\n"
+        "- MRN, 서버명, 수치 같은 핵심 정보는 유지\n"
+        "- 인사말, 서명, 면책 문구는 무시\n"
+        "- 원문에 없는 내용 추가 금지\n"
+        "- 요약 줄만 출력 (JSON, 설명 금지)\n\n"
+        f"[이전 대화]\n{convo}"
+    )
+    text = call_groq(prompt, temperature=0.2, effort="low")
+    if not text:
+        return None
+    out = []
+    for ln in text.splitlines():
+        ln = ln.strip().lstrip("-*• ").strip()
+        if ln:
+            out.append("• " + ln[:120])
+    out = out[:6]
+    if out and skipped:
+        out.append(f"(오래된 중간 대화 {skipped}건은 요약에서 제외)")
+    return out or None
+
+
+def build_recent_view(all_entries, ticket_id):
+    """/timeline: 접수 + 이전 대화 요약 + 최근 N건. 반환: (본문 줄, 현재 상황, 요약 실패 건수) / 전부 실패 시 (None, None, 0)"""
+    first, middle, recent = all_entries[0], all_entries[1:-RECENT_COUNT], all_entries[-RECENT_COUNT:]
+    res = summarize_batch([first] + recent, 1)
+    mid_lines = summarize_middle(middle)
+    if not res and not mid_lines:
+        return None, None, 0
+    first_line = res.get(1) or raw_snippet(first)
+    recent_lines = [res.get(i + 2) or raw_snippet(e) for i, e in enumerate(recent)]
+    failed = sum(1 for i in range(1, len(recent) + 2) if not res.get(i))
+    body = [
+        render_line(first, first_line),
+        f"━━ 이전 대화 {len(middle)}건 ({date_range(middle)}) 요약 ━━",
+    ]
+    body += mid_lines or [f"• 요약에 실패했어요. /all {ticket_id} 로 전체를 볼 수 있어요."]
+    body.append(f"━━ 최근 {len(recent)}건 ━━")
+    body += [render_line(e, s) for e, s in zip(recent, recent_lines)]
+    pseudo = {"time": middle[0]["time"], "kind": "이전 대화 요약", "who": "-", "side": "agent", "text": ""}
+    mid_text = " ".join(l.lstrip("• ").strip() for l in (mid_lines or ["요약 실패"]))
+    current = summarize_current([first, pseudo] + recent, [first_line, mid_text] + recent_lines)
+    return body, current, failed
+
+
+def build_full_view(all_entries, ticket_id):
+    """/all (또는 짧은 티켓): 대화를 한 줄씩 전부"""
+    entries, omitted = limit_entries(all_entries)
+    summaries, current, failed = summarize_timeline(entries)
+    if summaries is None:
+        return None, None, 0
+    body = []
+    for i, (e, s) in enumerate(zip(entries, summaries)):
+        body.append(render_line(e, s))
+        if i == 0 and omitted:
+            body.append(f"   … 중간 {omitted}건 생략 (/timeline {ticket_id} 에서 요약으로 확인) …")
+    return body, current, failed
+
+
+def run_timeline(chat_id, ticket_id, mode="recent"):
     try:
         r = fd_get(f"tickets/{ticket_id}")
         if r.status_code == 404:
@@ -574,37 +764,39 @@ def run_timeline(chat_id, ticket_id):
             send_telegram_to(chat_id, f"대화 내역 조회에 실패했어요. (코드 {err})")
             return
 
-        entries = build_timeline_entries(ticket, convs, {}, [10])
-        total, omitted = len(entries), 0
-        if total > MAX_TIMELINE_ENTRIES:
-            omitted = total - MAX_TIMELINE_ENTRIES
-            entries = entries[:1] + entries[-(MAX_TIMELINE_ENTRIES - 1):]
-
-        summaries, current = summarize_timeline(entries)
-        ai_ok = summaries is not None
-        if not ai_ok:
-            summaries = [(e["text"][:70] + ("…" if len(e["text"]) > 70 else "")) or "(내용 없음)" for e in entries]
-            current = "AI 요약에 실패해 원문 일부를 표시했어요."
-
-        icons = {"customer": "👤", "agent": "🛠", "note": "📝"}
+        all_entries = build_timeline_entries(ticket, convs, {}, [10])
+        total = len(all_entries)
         status = ticket.get("status")
+        label = status_text(status)
+        done = status in (4, 5) or bool(DONE_PATTERN.search(label or ""))
         created = parse_fd_time(ticket.get("created_at", ""))
+
+        compress = mode == "recent" and total > RECENT_COUNT + 2
+        if compress:
+            body, current, failed = build_recent_view(all_entries, ticket_id)
+        else:
+            body, current, failed = build_full_view(all_entries, ticket_id)
+
+        if body is None:  # AI 요약이 전부 실패 -> 원문 일부로 대체
+            shown = [all_entries[0]] + all_entries[-RECENT_COUNT:] if compress else limit_entries(all_entries)[0]
+            body = [render_line(e, raw_snippet(e)) for e in shown]
+            current, failed = "AI 요약에 실패해 원문 일부를 표시했어요.", 0
+        elif not current:
+            current = "현재 상황 요약에 실패했어요."
+        if failed:
+            current += f"\n(※ {failed}건은 요약에 실패해 원문 일부로 표시했어요)"
+
         head = [
-            f"🕘 #{ticket_id} 타임라인",
+            f"🕘 #{ticket_id} {'전체 타임라인' if mode == 'all' else '타임라인'}",
             (ticket.get("subject") or "")[:150],
-            f"상태: {TIMELINE_STATUS.get(status, f'상태코드 {status}')} · "
-            f"접수 {created.strftime('%m/%d') if created else '-'} · 대화 {total}건",
-            f"마지막 활동: {ago_text(entries[-1]['time'])}",
-            ball_in_court(entries, status),
+            f"상태: {label} · 접수 {created.strftime('%m/%d') if created else '-'} · 대화 {total}건",
+            f"마지막 활동: {ago_text(all_entries[-1]['time'])}",
+            ball_in_court(all_entries, done),  # 판단은 항상 전체 대화 기준
             "",
         ]
-        body = []
-        for i, (e, s) in enumerate(zip(entries, summaries)):
-            t = e["time"].strftime("%m/%d %H:%M") if e["time"] else "--/-- --:--"
-            body.append(f"{t} {icons[e['side']]} {e['who'][:16]} · {s}")
-            if i == 0 and omitted:
-                body.append(f"   … 중간 {omitted}건 생략 …")
         tail = ["", "📌 현재 상황", current or "-"]
+        if compress:
+            tail += ["", f"전체 대화는 /all {ticket_id}"]
         send_long(chat_id, "\n".join(head + body + tail))
     except Exception as ex:
         log(f"[타임라인] 오류: {ex}")
@@ -614,21 +806,23 @@ def run_timeline(chat_id, ticket_id):
             pass
 
 
-def handle_timeline_command(chat_id, text):
+def handle_timeline_command(chat_id, text, mode="recent"):
+    name = "all" if mode == "all" else "timeline"
     if not is_allowed_chat(chat_id):
         send_telegram_to(
             chat_id,
-            "이 채팅에서는 /timeline을 사용할 수 없어요.\n"
+            f"이 채팅에서는 /{name}을(를) 사용할 수 없어요.\n"
             f"(chat id: {chat_id})\n관리자가 Render 환경변수 ALLOWED_CHAT_IDS에 이 값을 추가하면 사용할 수 있어요.",
         )
         return
-    m = re.search(r'(\d{3,})', text)
+    args = re.sub(r'^/\w+(@\w+)?', '', text)
+    m = re.search(r'(\d{3,})', args)
     if not m:
-        send_telegram_to(chat_id, "티켓 번호를 입력해 주세요. 예: /timeline 14564")
+        send_telegram_to(chat_id, f"티켓 번호를 입력해 주세요. 예: /{name} 14564")
         return
     ticket_id = m.group(1)
-    send_telegram_to(chat_id, f"⏳ #{ticket_id} 타임라인 정리 중...")
-    threading.Thread(target=run_timeline, args=(chat_id, ticket_id), daemon=True).start()
+    send_telegram_to(chat_id, f"⏳ #{ticket_id} {'전체 ' if mode == 'all' else ''}타임라인 정리 중...")
+    threading.Thread(target=run_timeline, args=(chat_id, ticket_id, mode), daemon=True).start()
 
 
 @app.route("/webhook/telegram", methods=["POST"])
@@ -646,8 +840,9 @@ def telegram_webhook():
         log(f"[텔레그램] 메시지 수신: {text[:50]}")
         log(f"[텔레그램] 원문: {text}")
 
-        if re.match(r'^/timeline(@\w+)?(\s|$)', text, re.IGNORECASE):
-            handle_timeline_command(chat_id, text)
+        cmd = re.match(r'^/(timeline|all)(@\w+)?(\s|$)', text, re.IGNORECASE)
+        if cmd:
+            handle_timeline_command(chat_id, text, "all" if cmd.group(1).lower() == "all" else "recent")
             return jsonify({"status": "ok"}), 200
 
         if text.lower().startswith("/search"):
