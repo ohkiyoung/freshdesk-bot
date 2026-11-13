@@ -403,14 +403,14 @@ def send_telegram_to(chat_id, message):
 
 
 
-# ───────────── /timeline : 티켓 흐름 한눈에 보기 ─────────────
+# ───────────── /t(=/timeline), /a(=/all) : 티켓 흐름 한눈에 보기 ─────────────
 KST = timezone(timedelta(hours=9))
 TIMELINE_STATUS = {2: "접수", 3: "대기중", 4: "해결됨", 5: "종료", 6: "고객 답변 대기", 7: "제3자 대기"}
 MAX_TIMELINE_ENTRIES = 40
 
 
 def is_allowed_chat(chat_id):
-    """/timeline은 내부메모를 포함하므로 허용된 채팅에서만 동작"""
+    """/t, /a 는 내부메모를 포함하므로 허용된 채팅에서만 동작"""
     allowed = {TELEGRAM_CHAT_ID.strip()} if TELEGRAM_CHAT_ID else set()
     extra = os.environ.get("ALLOWED_CHAT_IDS", "")
     allowed |= {x.strip() for x in extra.split(",") if x.strip()}
@@ -726,7 +726,7 @@ def build_recent_view(all_entries, ticket_id):
         render_line(first, first_line),
         f"━━ 이전 대화 {len(middle)}건 ({date_range(middle)}) 요약 ━━",
     ]
-    body += mid_lines or [f"• 요약에 실패했어요. /all {ticket_id} 로 전체를 볼 수 있어요."]
+    body += mid_lines or [f"• 요약에 실패했어요. /a {ticket_id} 로 전체를 볼 수 있어요."]
     body.append(f"━━ 최근 {len(recent)}건 ━━")
     body += [render_line(e, s) for e, s in zip(recent, recent_lines)]
     pseudo = {"time": middle[0]["time"], "kind": "이전 대화 요약", "who": "-", "side": "agent", "text": ""}
@@ -745,7 +745,7 @@ def build_full_view(all_entries, ticket_id):
     for i, (e, s) in enumerate(zip(entries, summaries)):
         body.append(render_line(e, s))
         if i == 0 and omitted:
-            body.append(f"   … 중간 {omitted}건 생략 (/timeline {ticket_id} 에서 요약으로 확인) …")
+            body.append(f"   … 중간 {omitted}건 생략 (/t {ticket_id} 에서 요약으로 확인) …")
     return body, current, failed
 
 
@@ -796,7 +796,7 @@ def run_timeline(chat_id, ticket_id, mode="recent"):
         ]
         tail = ["", "📌 현재 상황", current or "-"]
         if compress:
-            tail += ["", f"전체 대화는 /all {ticket_id}"]
+            tail += ["", f"전체 대화는 /a {ticket_id}"]
         send_long(chat_id, "\n".join(head + body + tail))
     except Exception as ex:
         log(f"[타임라인] 오류: {ex}")
@@ -807,7 +807,7 @@ def run_timeline(chat_id, ticket_id, mode="recent"):
 
 
 def handle_timeline_command(chat_id, text, mode="recent"):
-    name = "all" if mode == "all" else "timeline"
+    name = "a" if mode == "all" else "t"
     if not is_allowed_chat(chat_id):
         send_telegram_to(
             chat_id,
@@ -840,9 +840,9 @@ def telegram_webhook():
         log(f"[텔레그램] 메시지 수신: {text[:50]}")
         log(f"[텔레그램] 원문: {text}")
 
-        cmd = re.match(r'^/(timeline|all)(@\w+)?(\s|$)', text, re.IGNORECASE)
+        cmd = re.match(r'^/(timeline|all|t|a)(@\w+)?(\s|$)', text, re.IGNORECASE)
         if cmd:
-            handle_timeline_command(chat_id, text, "all" if cmd.group(1).lower() == "all" else "recent")
+            handle_timeline_command(chat_id, text, "all" if cmd.group(1).lower() in ("all", "a") else "recent")
             return jsonify({"status": "ok"}), 200
 
         if text.lower().startswith("/search"):
